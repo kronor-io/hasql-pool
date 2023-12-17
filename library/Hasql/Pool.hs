@@ -15,6 +15,7 @@ import Hasql.Connection (Connection)
 import qualified Hasql.Connection as Connection
 import Hasql.Pool.Prelude
 import qualified Hasql.Session as Session
+import qualified UnliftIO as Unlift
 
 -- | A connection tagged with metadata.
 data Conn = Conn
@@ -154,7 +155,7 @@ release Pool {..} =
 --
 -- __Warning:__ Due to the mechanism mentioned above you should avoid consuming
 -- errors within sessions.
-use :: Pool -> Session.Session a -> IO (Either UsageError a)
+use :: forall a. Pool -> Session.Session a -> IO (Either UsageError a)
 use Pool {..} sess = do
   timeout <- do
     delay <- registerDelay poolAcquisitionTimeout
@@ -177,6 +178,7 @@ use Pool {..} sess = do
             else retry
       ]
   where
+    onNewConn :: TVar Bool -> IO (Either UsageError a)
     onNewConn reuseVar = do
       settings <- poolFetchConnectionSettings
       now <- getMonotonicTimeNSec
@@ -187,6 +189,7 @@ use Pool {..} sess = do
           return $ Left $ ConnectionUsageError connErr
         Right conn -> onLiveConn reuseVar (Conn conn now now)
 
+    onConn :: TVar Bool -> Conn -> IO (Either UsageError a)
     onConn reuseVar conn = do
       now <- getMonotonicTimeNSec
       if isAlive poolMaxLifetime poolMaxIdletime now conn
@@ -195,6 +198,7 @@ use Pool {..} sess = do
           Connection.release (connConnection conn)
           onNewConn reuseVar
 
+    onLiveConn :: TVar Bool -> Conn -> IO (Either UsageError a)
     onLiveConn reuseVar conn = do
       sessRes <-
         catch (Session.run sess (connConnection conn)) $ \(err :: SomeException) -> do
@@ -234,3 +238,90 @@ data UsageError
   deriving (Show, Eq)
 
 instance Exception UsageError
+
+-- |
+-- Use a connection from the pool to run some actions on the database,
+-- and return the connection to the pool, when finished.
+--
+withConn ::
+  forall m a.
+  Unlift.MonadUnliftIO m =>
+  Pool ->
+  (Connection -> m a) ->
+  m (Either UsageError a)
+withConn Pool {..} action = do
+  timeout <- liftIO $ do
+    delay <- registerDelay poolAcquisitionTimeout
+    return $ readTVar delay
+  join . liftIO . atomically $ do
+    reuseVar <- readTVar poolReuseVar
+    asum
+      [ readTQueue poolConnectionQueue <&> onConn reuseVar,
+        do
+          capVal <- readTVar poolCapacity
+          if capVal > 0
+            then do
+              writeTVar poolCapacity $! pred capVal
+              return $ onNewConn reuseVar
+            else retry,
+        do
+          timedOut <- timeout
+          if timedOut
+            then return . return . Left $ AcquisitionTimeoutUsageError
+            else retry
+      ]
+  where
+    onNewConn :: TVar Bool -> m (Either UsageError a)
+    onNewConn reuseVar = do
+      settings <- liftIO poolFetchConnectionSettings
+      now <- liftIO getMonotonicTimeNSec
+      connRes <- liftIO $ Connection.acquire settings
+      case connRes of
+        Left connErr -> liftIO $ do
+          atomically $ modifyTVar' poolCapacity succ
+          return $ Left $ ConnectionUsageError connErr
+        Right conn -> onLiveConn reuseVar (Conn conn now now)
+
+    onConn :: TVar Bool -> Conn -> m (Either UsageError a)
+    onConn reuseVar conn = do
+      now <- liftIO getMonotonicTimeNSec
+      if isAlive poolMaxLifetime poolMaxIdletime now conn
+        then onLiveConn reuseVar conn {connUseTimeNSec = now}
+        else do
+          liftIO $ Connection.release (connConnection conn)
+          onNewConn reuseVar
+
+    onLiveConn :: TVar Bool -> Conn -> m (Either UsageError a)
+    onLiveConn reuseVar conn = do
+      actionResult <-
+        Unlift.catch (action (connConnection conn)) $ \(err :: SomeException) -> liftIO $ do
+          Connection.release (connConnection conn)
+          atomically $ modifyTVar' poolCapacity succ
+          throw err
+      let pingSql = Session.sql "/* ping */ select 1::bigint"
+      sessResult <- liftIO $ do
+        Unlift.catch (Session.run pingSql (connConnection conn)) $ \(err :: SomeException) -> do
+          Connection.release (connConnection conn)
+          atomically $ modifyTVar' poolCapacity succ
+          throw err
+
+      liftIO $ case sessResult of
+        Left err -> case err of
+          Session.QueryError _ _ (Session.ClientError _) -> do
+            atomically $ modifyTVar' poolCapacity succ
+            return $ Left $ SessionUsageError err
+          _ -> do
+            returnConn
+            return $ Left $ SessionUsageError err
+        Right res -> do
+          returnConn
+          return $ Right actionResult
+      where
+        returnConn =
+          join . atomically $ do
+            reuse <- readTVar reuseVar
+            if reuse
+              then writeTQueue poolConnectionQueue conn $> return ()
+              else return $ do
+                Connection.release (connConnection conn)
+                atomically $ modifyTVar' poolCapacity succ
