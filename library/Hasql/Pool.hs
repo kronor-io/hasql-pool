@@ -4,6 +4,7 @@ module Hasql.Pool
     acquire,
     acquireDynamically,
     use,
+    withConn,
     release,
 
     -- * Errors
